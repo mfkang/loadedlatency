@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "perfmeasure.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,48 +8,52 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
-#include <sys/time.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <sched.h>
 
-// Structure to hold event info
+// Structure to hold event information.
 struct event_info {
-    const char *name;    // Event name
-    uint32_t type;       // Event type
-    uint64_t config;     // Event id
+    const char *name;    // Event name.
+    uint32_t type;       // Event type.
+    uint64_t config;     // Event configuration value.
 };
 
+// Updated array of events to be measured.
 struct event_info events[] = {
-    {"hnf_mc_reqs",          0x0d, 0xd0005 },
-    {"hnf_mc_retries",       0x0d, 0xc0005},
-    {"hnf_pocq_reqs_recvd",  0x0d, 0x50005},
-    {"hnf_pocq_retry",       0x0d, 0x40005}
+    {"dtc_cycles",          0x0d, 0x3 },
+    {"hnf_pocq_reqs_recvd", 0x0d, 0x50005},
+    {"hnf_pocq_retry",      0x0d, 0x40005},
+    {"hnf_cache_miss",      0x0d, 0x10005},
+    {"hnf_slc_sf_cache_access", 0x0d, 0x20005},
+    {"hnf_cache_fill",      0x0d, 0x30005},
+    {"hnf_mc_reqs",         0x0d, 0xd0005 },
+    {"hnf_mc_retries",      0x0d, 0xc0005}
 };
-#define num_events 4
-int fds[num_events];
 
-// perf_event_open wrapper
-static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
-                            int cpu, int group_fd, unsigned long flags)
-{
-    return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
-}
+#define NUM_EVENTS (sizeof(events)/sizeof(events[0]))
 
-// Structure corresponding to the read format when using
-// PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING.
-// It contains 3 64-bit fields: value, time_enabled, time_running.
+// Array of file descriptors for the perf events.
+int fds[NUM_EVENTS];
+
+// Structure for reading perf event counters together with timing info.
 struct read_format {
     uint64_t value;
     uint64_t time_enabled;
     uint64_t time_running;
 };
 
-// Function to set up perf events and enable them
+// perf_event_open wrapper function.
+static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
+                            int cpu, int group_fd, unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
+}
+
+// Function to set up and enable all perf events.
 void setup_and_enable_perf() {
     struct perf_event_attr pe;
     int cpu = sched_getcpu();
-
     if (cpu < 0) {
         perror("sched_getcpu failed");
         exit(EXIT_FAILURE);
@@ -60,11 +65,11 @@ void setup_and_enable_perf() {
     pe.sample_type = PERF_SAMPLE_IDENTIFIER;
     pe.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
     pe.inherit = 1;
-    pe.disabled = 1;         // Start disabled
-    pe.exclude_kernel = 0;   // Include kernel mode events (set as needed)
-    pe.exclude_hv = 0;       // Include hypervisor events (set as needed)
-    
-    for (int i = 0; i < num_events; i++) {
+    pe.disabled = 1;         // Start events disabled.
+    pe.exclude_kernel = 0;   // Include kernel mode events.
+    pe.exclude_hv = 0;       // Include hypervisor events.
+
+    for (int i = 0; i < NUM_EVENTS; i++) {
         pe.type = events[i].type;
         pe.config = events[i].config;
         fds[i] = perf_event_open(&pe, -1, cpu, -1, 0);
@@ -73,9 +78,9 @@ void setup_and_enable_perf() {
             exit(EXIT_FAILURE);
         }
     }
-    
-    // Reset and enable all events
-    for (int i = 0; i < num_events; i++) {
+
+    // Reset and enable all events.
+    for (int i = 0; i < NUM_EVENTS; i++) {
         if (ioctl(fds[i], PERF_EVENT_IOC_RESET, 0) == -1) {
             perror("ioctl(PERF_EVENT_IOC_RESET) failed");
             exit(EXIT_FAILURE);
@@ -87,52 +92,24 @@ void setup_and_enable_perf() {
     }
 }
 
-// Disable perf events, read and print counter data, and close file descriptors
+// Declare external global variable to store event results (defined in loadedlatency.c).
+extern unsigned long long event_results[NUM_EVENTS];
+
+// Function to disable perf events, read their counters, and store results in event_results.
 void read_and_disable_perf() {
-    // Disable all events
-    for (int i = 0; i < num_events; i++) {
+    for (int i = 0; i < NUM_EVENTS; i++) {
         if (ioctl(fds[i], PERF_EVENT_IOC_DISABLE, 0) == -1) {
             perror("ioctl(PERF_EVENT_IOC_DISABLE) failed");
             exit(EXIT_FAILURE);
         }
     }
-    
-    // Read and print the 24-byte counter data for each event.
     struct read_format rf;
-    for (int i = 0; i < num_events; i++) {
+    for (int i = 0; i < NUM_EVENTS; i++) {
         if (read(fds[i], &rf, sizeof(rf)) == -1) {
             perror("read failed");
             exit(EXIT_FAILURE);
         }
-        printf("Event %s:\n", events[i].name);
-        printf("  value:         %llu\n", (unsigned long long)rf.value);
-//        printf("  time_enabled:  %llu\n", (unsigned long long)rf.time_enabled);
-//        printf("  time_running:  %llu\n", (unsigned long long)rf.time_running);
+        event_results[i] = rf.value;
         close(fds[i]);
     }
 }
-
-#ifdef _standalone_
-// The region of interest (workload) to be measured
-void workload_region(void) {
-    // Replace this dummy workload with your actual code region.
-    volatile int dummy = 0;
-    for (int i = 0; i < 100000000; i++) {
-        dummy += i;
-    }
-}
-
-int main(void)
-{
-    // Setup and enable perf events
-    setup_and_enable_perf();
-    
-    // Execute the workload region to be measured
-    workload_region();
-    
-    // Read the perf data, disable events, and close file descriptors
-    read_and_disable_perf();
-    
-    return 0;
-}
-#endif
